@@ -1,0 +1,13 @@
+[package]
+name = "replayable-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "L4 LLM API proxy for Replayable — language- and framework-agnostic agent trace capture"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
