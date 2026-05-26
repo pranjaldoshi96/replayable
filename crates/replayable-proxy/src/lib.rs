@@ -5,9 +5,13 @@
 //! intentionally small.
 
 pub mod config;
+pub mod proxy;
+pub mod server;
 pub mod trace;
 
 pub use config::{Config, ConfigError};
+pub use proxy::{AppState, PROXY_PATH, SCHEMA_VERSION};
+pub use server::router;
 pub use trace::{
     new_trace_id, now_rfc3339, spawn_pipeline, AgentTrace, ModelCall, TokenUsage, TracePipeline,
     TraceWriter, FRAMEWORK_TAG,
