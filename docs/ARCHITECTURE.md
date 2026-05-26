@@ -28,6 +28,27 @@ Reversibility is labelled per major decision as **two-way door** or **one-way do
 
 A self-hostable OSS toolkit that **captures every step of a production agent run, replays it deterministically, and turns the captured trace into a scoreable regression test.** Captured traces are first-class artifacts: they are stored, queryable, replayable with edits, and consumed by an eval engine that scores them against a versioned dataset. CI gates merge on regressions against the eval engine's verdict.
 
+### Capture layer stack
+
+Figure 1: the four capture layers, ordered by data richness against language coverage.
+Prefer the topmost layer that fits your runtime; lower layers are universal fallbacks.
+
+```mermaid
+flowchart TB
+    R["Richest agent semantics ↑"]:::label
+    L2["L2 — Native framework adapters<br/>(LangGraph, CrewAI, OpenAI Agents, LlamaIndex, Vercel AI, Mastra)"]
+    L1["L1 — OTel GenAI ingest<br/>(any OTLP-conformant emitter)"]
+    L3["L3 — Coding-agent CLI shims<br/>(Claude Code, Cursor, Aider)"]
+    L4["L4 — Local LLM-API proxy sidecar<br/>(language-agnostic fallback)"]
+    B["Broadest language coverage ↓"]:::label
+
+    R --> L2 --> L1 --> L3 --> L4 --> B
+
+    classDef label fill:#eee,stroke:#999,color:#555,font-style:italic;
+```
+
+All four layers normalise into the same canonical `AgentTrace` schema at the ingest collector (see §4.1).
+
 ### External actors
 
 | Actor | Interaction |
@@ -118,6 +139,50 @@ A self-hostable OSS toolkit that **captures every step of a production agent run
 
 Note: the **control plane** (projects, users, datasets, eval runs, judge cache keys, audit log) always lives in Postgres regardless of whether traces live in ClickHouse or Postgres. ClickHouse is a trace/span store only.
 
+### Container map (mermaid)
+
+Figure 2: runtime topology of the v1 single-host deployment.
+Arrow direction indicates the flow of trace data from the agent into storage and out to the UI.
+
+```mermaid
+flowchart LR
+    subgraph Agent["Agent process"]
+        AC["Agent code"]
+        SDK["L1 OTel SDK"]
+        ADP["L2 adapter"]
+        SHIM["L3 CLI shim"]
+        AC --> SDK
+        AC --> ADP
+        AC -. "external CLI" .-> SHIM
+    end
+
+    PROXY["L4 proxy sidecar<br/>(Rust)"]
+    INGEST["Ingest collector<br/>(Go)"]
+    CH[("ClickHouse<br/>trace store")]
+    PG[("Postgres<br/>control plane")]
+    REDIS[("Redis<br/>judge cache")]
+    API["API server<br/>(Python / FastAPI)<br/>+ replay + eval engines"]
+    UI["Web UI<br/>(Next.js)"]
+    CLI["agentctl CLI<br/>(Go)"]
+    LLM["LLM provider API"]
+
+    AC -- "HTTPS" --> PROXY
+    PROXY -- "forwards verbatim" --> LLM
+    PROXY -- "async tee (OTLP)" --> INGEST
+    SDK -- "OTLP gRPC/HTTP" --> INGEST
+    ADP -- "OTLP gRPC/HTTP" --> INGEST
+    SHIM -- "OTLP gRPC/HTTP" --> INGEST
+
+    INGEST --> CH
+    INGEST --> PG
+    API --> CH
+    API --> PG
+    API --> REDIS
+    UI -- "REST / WebSocket" --> API
+    CLI -- "REST" --> API
+    CLI -- "OTLP" --> INGEST
+```
+
 ### Container table
 
 | Container | Lang | Public surface | Persistence | Scaling story | Perf budget slot |
@@ -203,6 +268,30 @@ Only the load-bearing ones. Not exhaustive.
 
 Three sub-flows depending on capture layer; all converge at the ingest collector.
 
+Figure 3: capture data flow from agent code through ingest into storage.
+The same five steps (capture → normalise → redact → store) execute regardless of which layer originated the span.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Agent as Agent code
+    participant Cap as SDK / adapter / proxy
+    participant Ingest as Ingest collector
+    participant Norm as Schema normalizer
+    participant Red as Redaction processor
+    participant Store as Trace store<br/>(ClickHouse / Postgres)
+
+    Agent->>Cap: emit span / proxied request
+    Cap->>Ingest: OTLP gRPC/HTTP
+    Ingest->>Norm: raw OTel spans
+    Norm->>Norm: map gen_ai.* → canonical AgentTrace<br/>preserve unknowns under raw.*
+    Norm->>Red: canonical spans
+    Red->>Red: apply pluggable scrubbers
+    Red->>Store: persist trace + spans + events
+    Store-->>Ingest: ack
+    Note over Cap,Ingest: Async export only.<br/>Bounded queue drops on full;<br/>agent hot path never blocks.
+```
+
 **L1 (OTel ingest):**
 ```
 agent code  -> OTel SDK -> BSP queue -> OTLP exporter -> Ingest collector
@@ -246,6 +335,43 @@ Critical property: the forward path **never** waits on the tee branch. SYNTHESIS
 
 ### 4.2 Replay flow
 
+Figure 4: replay data flow from a UI or CLI replay request through context reconstruction, re-execution, and (optional) eval scoring.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client as UI / CLI
+    participant API as API server
+    participant Replay as Replay engine
+    participant Store as Trace store
+    participant LLM as LLM provider
+    participant Eval as Eval engine
+
+    Client->>API: POST /replay/{trace_id}<br/>(ReplaySpec)
+    API->>Replay: dispatch
+    Replay->>Store: fetch original trace
+    Store-->>Replay: canonical AgentTrace
+    Replay->>Replay: reconstruct per-turn context<br/>(snapshots or patch log)
+    loop for each step
+        Replay->>Replay: tool router (pinned / live / modified)
+        alt pinned tool
+            Replay->>Replay: return captured payload
+        else live or modified
+            Replay->>LLM: re-issue call with same / edited params
+            LLM-->>Replay: response
+        end
+        Replay->>Store: emit replay span
+    end
+    Replay->>Replay: build replay_manifest<br/>(determinism contract)
+    Replay->>Store: persist replay trace<br/>(replay_of = original)
+    opt eval requested
+        Replay->>Eval: score new trace vs dataset row
+        Eval-->>Replay: score delta
+    end
+    Replay-->>API: { replay_trace_id, manifest, score_delta }
+    API-->>Client: response
+```
+
 ```
 UI/CLI -> API server /replay/{trace_id}  (REST POST, body = ReplaySpec)
               |
@@ -274,6 +400,29 @@ UI/CLI -> API server /replay/{trace_id}  (REST POST, body = ReplaySpec)
 ```
 
 ### 4.3 Eval flow
+
+Figure 5: eval execution model.
+Deterministic evaluators run first and gate the LLM-judge cascade; the judge cache and per-run budget enforcer keep costs predictable.
+
+```mermaid
+flowchart TD
+    Start(["Dataset version<br/>+ system version"]) --> Loader["Dataset loader"]
+    Loader --> Dispatch["Evaluator dispatcher"]
+    Dispatch --> Det["Deterministic cascade<br/>(exact-match, JSON-schema, regex,<br/>tool-call-strict, cost-budget,<br/>trajectory matchers)"]
+    Det -->|all pass| Done["Result writer<br/>(process_score + outcome_score)"]
+    Det -->|fail or flagged| Cache{"Judge cache hit?<br/>key = (trace_hash,<br/>prompt_version, model)"}
+    Cache -->|hit| Done
+    Cache -->|miss| Budget{"Budget remaining?"}
+    Budget -->|no| Halt["Halt run<br/>(budget_halted,<br/>partial results retained)"]
+    Budget -->|yes| Cheap["Cheap judge<br/>(pointwise / pairwise)"]
+    Cheap --> Agree{"Confident?<br/>(no disagreement signal)"}
+    Agree -->|yes| Persist["Write judge result<br/>to cache"]
+    Agree -->|no| Expensive["Escalate to expensive judge"]
+    Expensive --> Persist
+    Persist --> Done
+    Done --> Store[("Result store<br/>(Postgres)")]
+    Halt --> Store
+```
 
 ```
 CLI/CI/UI -> API server /eval/runs  (POST, body = EvalRunSpec)
