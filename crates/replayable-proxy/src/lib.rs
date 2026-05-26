@@ -7,6 +7,7 @@
 pub mod config;
 pub mod proxy;
 pub mod server;
+pub mod shutdown;
 pub mod trace;
 
 pub use config::{Config, ConfigError};
