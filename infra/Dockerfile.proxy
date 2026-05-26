@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1.7
+
+# ------------------------------------------------------------
+# Build stage: compile the replayable-proxy binary in release.
+# ------------------------------------------------------------
+FROM rust:1.75-slim-bookworm AS builder
+WORKDIR /workspace
+
+# System packages required by rustls / reqwest at build time.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the entire crates workspace and build only the proxy binary.
+COPY crates ./crates
+
+RUN cd crates && cargo build --release -p replayable-proxy
+
+# ------------------------------------------------------------
+# Runtime stage: minimal Debian slim with the static-ish binary.
+# ------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 1001 replayable \
+    && useradd --system --uid 1001 --gid replayable --create-home replayable
+
+COPY --from=builder /workspace/crates/target/release/replayable-proxy /usr/local/bin/replayable-proxy
+
+USER replayable
+WORKDIR /home/replayable
+
+ENV REPLAYABLE_LISTEN=0.0.0.0:8080
+ENV REPLAYABLE_LOG_PATH=/home/replayable/replayable-traces.jsonl
+
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/replayable-proxy"]

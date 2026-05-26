@@ -1,13 +1,61 @@
 [package]
 name = "replayable-proxy"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "L4 LLM API proxy for Replayable — language- and framework-agnostic agent trace capture"
 
 [dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "io-util", "fs", "time", "net"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+# HTTP server and client
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+tower-service = "0.3"
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# IDs and time
+uuid = { version = "1", features = ["v7"] }
+time = { version = "0.3", features = ["formatting", "serde-well-known"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# URL parsing (used for SSRF-defensive upstream validation)
+url = "2"
+
+# Errors
+thiserror = "1"
+anyhow = "1"
+
+# Unix-only OpenOptions flags (O_NOFOLLOW)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "json"] }
+wiremock = "0.6"
+criterion = { version = "0.5", features = ["async_tokio"] }
+tempfile = "3"
+
+[[bench]]
+name = "proxy_overhead"
+harness = false
 
 [lints]
 workspace = true

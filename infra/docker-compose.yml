@@ -55,6 +55,47 @@ services:
   #     CLICKHOUSE_URL: http://clickhouse:8123
   #     POSTGRES_URL: postgresql://replayable:replayable@postgres:5432/replayable
 
+  proxy:                  # L4 LLM API proxy (Rust). Sidecar; no DB dependencies.
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.proxy
+    container_name: replayable-proxy
+    ports:
+      # Bind to loopback only on the host (security review H4). The proxy
+      # captures API credentials and request/response bodies and must not
+      # be reachable from other hosts on the LAN. Operators who explicitly
+      # want LAN exposure can change this to `8088:8080`.
+      - "127.0.0.1:8088:8080"
+    environment:
+      # REPLAYABLE_UPSTREAM_URL is required; the proxy fails fast on startup
+      # when it is unset, so operators MUST supply it (e.g. via
+      # `docker compose --env-file ./.env up proxy`).
+      # The proxy listens on 0.0.0.0 *inside the container* so the host
+      # port-mapping above can reach it; loopback-only exposure is
+      # enforced by the `127.0.0.1:` prefix on the published port.
+      REPLAYABLE_LISTEN: 0.0.0.0:8080
+      REPLAYABLE_UPSTREAM_URL: ${REPLAYABLE_UPSTREAM_URL:-}
+      REPLAYABLE_LOG_PATH: /home/replayable/replayable-traces.jsonl
+      REPLAYABLE_LOG_CHANNEL_CAPACITY: "1024"
+      # Secure defaults — see crates/replayable-proxy/README.md for full
+      # documentation. Content capture is off; bodies above 10 MiB are
+      # rejected with HTTP 413; reqwest has 10s connect and 600s read
+      # timeouts; plaintext upstreams are only allowed for loopback.
+      REPLAYABLE_CAPTURE_CONTENT: "${REPLAYABLE_CAPTURE_CONTENT:-false}"
+      REPLAYABLE_MAX_REQUEST_BYTES: "${REPLAYABLE_MAX_REQUEST_BYTES:-10485760}"
+      REPLAYABLE_CONNECT_TIMEOUT_SECS: "${REPLAYABLE_CONNECT_TIMEOUT_SECS:-10}"
+      REPLAYABLE_READ_TIMEOUT_SECS: "${REPLAYABLE_READ_TIMEOUT_SECS:-600}"
+      REPLAYABLE_UPSTREAM_ALLOW_PLAINTEXT: "${REPLAYABLE_UPSTREAM_ALLOW_PLAINTEXT:-false}"
+    volumes:
+      - proxy_traces:/home/replayable
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
 volumes:
   clickhouse_data:
   postgres_data:
+  proxy_traces:
