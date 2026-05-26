@@ -11,12 +11,14 @@ See [ADR-0003](../../docs/adr/0003-l4-proxy-language-and-design.md) for the lang
 
 ## What v0.1.0 ships
 
-- HTTP server on a configurable TCP address (default `0.0.0.0:8080`).
+- HTTP server on a configurable TCP address (default `127.0.0.1:8080` — loopback only).
 - `POST /v1/chat/completions` accepted — everything else returns a JSON 404.
 - Verbatim forwarding to `REPLAYABLE_UPSTREAM_URL` (hop-by-hop headers stripped).
+- Defence-in-depth defaults: content capture is OFF, request bodies above 10 MiB are rejected with HTTP 413, upstream `https://` is required outside loopback, and reqwest enforces 10s connect / 600s read timeouts.
 - Streaming SSE pass-through (detected on upstream `Content-Type: text/event-stream`) with zero buffering and the standard SSE hygiene headers (`X-Accel-Buffering: no`, `Cache-Control: no-transform, no-cache`).
 - Per-request canonical `AgentTrace` record written as one JSON line on a background tokio task fed by a bounded mpsc channel; full queue increments a `dropped` counter and logs a warning instead of blocking the request hot path.
 - `GET /healthz` returning `200 {"status":"ok","version":"0.1.0"}` for liveness probes.
+- Trace-time header scrubbing for credential-bearing names (`authorization`, `x-api-key`, `cookie`, `set-cookie`, etc.) when content capture is enabled.
 - Graceful shutdown on SIGINT and SIGTERM — server stops accepting connections, in-flight requests get up to 30 s to drain, then the JSONL writer is flushed before exit.
 - Docker image and `docker compose` entry under `infra/`.
 
@@ -26,12 +28,19 @@ Out of scope for v0.1.0 (intentionally deferred): Anthropic / Bedrock / Mistral 
 
 The proxy is configured exclusively from environment variables:
 
-| Variable                          | Required | Default                       | Description                                                          |
-|-----------------------------------|----------|-------------------------------|----------------------------------------------------------------------|
-| `REPLAYABLE_UPSTREAM_URL`         | yes      | (none — fails fast if unset)  | Upstream LLM provider base URL (e.g. `https://api.openai.com`).      |
-| `REPLAYABLE_LISTEN`               | no       | `0.0.0.0:8080`                | `host:port` to bind the HTTP server.                                 |
-| `REPLAYABLE_LOG_PATH`             | no       | `./replayable-traces.jsonl`   | Filesystem path the JSONL trace writer appends to.                   |
-| `REPLAYABLE_LOG_CHANNEL_CAPACITY` | no       | `1024`                        | Bounded mpsc capacity for trace records. Full → drop + warn + count. |
+| Variable                              | Required | Default                       | Description                                                                                                                                                                                                                          |
+|---------------------------------------|----------|-------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `REPLAYABLE_UPSTREAM_URL`             | yes      | (none — fails fast if unset)  | Upstream LLM provider base URL (e.g. `https://api.openai.com`). Plaintext `http://` is rejected unless the host is loopback or `REPLAYABLE_UPSTREAM_ALLOW_PLAINTEXT=true`. Cloud-metadata hosts (e.g. `169.254.169.254`) are blocked. |
+| `REPLAYABLE_LISTEN`                   | no       | `127.0.0.1:8080`              | `host:port` to bind the HTTP server. Defaults to loopback so a misconfigured deploy does not expose captured credentials to the LAN. Set to `0.0.0.0:8080` only when you really mean it.                                              |
+| `REPLAYABLE_LOG_PATH`                 | no       | `./replayable-traces.jsonl`   | Filesystem path the JSONL trace writer appends to. The file is created mode `0600` and opened with `O_NOFOLLOW` on Unix — symlinks at this path are rejected with `ELOOP`.                                                           |
+| `REPLAYABLE_LOG_CHANNEL_CAPACITY`     | no       | `1024`                        | Bounded mpsc capacity for trace records. Full → drop + warn + count.                                                                                                                                                                 |
+| `REPLAYABLE_CAPTURE_CONTENT`          | no       | `false`                       | When `false` (the secure default), `model_calls[].input` and `.output` are empty and `request_headers`/`response_headers` are omitted. When `true`, bodies are persisted verbatim and a startup warning is logged.                   |
+| `REPLAYABLE_MAX_REQUEST_BYTES`        | no       | `10485760` (10 MiB)           | Cap on accepted client request body size. Oversized requests are rejected with HTTP 413 before the upstream is dialled and no trace is written.                                                                                      |
+| `REPLAYABLE_CONNECT_TIMEOUT_SECS`     | no       | `10`                          | TCP connect timeout for the reqwest client used to call the upstream.                                                                                                                                                                |
+| `REPLAYABLE_READ_TIMEOUT_SECS`        | no       | `600`                         | Per-read socket timeout. The timer resets on every chunk, so healthy streaming responses are unaffected; it only fires on prolonged silence from the upstream.                                                                       |
+| `REPLAYABLE_UPSTREAM_ALLOW_PLAINTEXT` | no       | `false`                       | When `true`, accept a plaintext `http://` upstream even when its host is not loopback. Use only in trusted private networks.                                                                                                         |
+
+When content capture is enabled, the following request/response header values are scrubbed (replaced with `[REDACTED]`) before being written to the JSONL trace, regardless of casing: `authorization`, `x-api-key`, `api-key`, `proxy-authorization`, `cookie`, `set-cookie`. The headers themselves are still listed so operators can see what the client sent — only the values are hidden.
 
 ## Build and test
 
