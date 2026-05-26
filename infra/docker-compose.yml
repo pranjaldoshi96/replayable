@@ -1,0 +1,60 @@
+# Local development infrastructure for Replayable.
+# See infra/README.md for usage.
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.10-alpine
+    container_name: replayable-clickhouse
+    ports:
+      - "8123:8123"   # HTTP interface
+      - "9000:9000"   # Native TCP
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_DB: replayable
+      CLICKHOUSE_USER: replayable
+      CLICKHOUSE_PASSWORD: replayable
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: replayable-postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: replayable
+      POSTGRES_PASSWORD: replayable
+      POSTGRES_DB: replayable
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U replayable -d replayable"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # API server (FastAPI). Commented out until a Dockerfile exists.
+  # server:
+  #   build:
+  #     context: ..
+  #     dockerfile: infra/Dockerfile.server
+  #   depends_on:
+  #     clickhouse:
+  #       condition: service_healthy
+  #     postgres:
+  #       condition: service_healthy
+  #   ports:
+  #     - "8080:8080"
+  #   environment:
+  #     REPLAYABLE_STORAGE: clickhouse
+  #     CLICKHOUSE_URL: http://clickhouse:8123
+  #     POSTGRES_URL: postgresql://replayable:replayable@postgres:5432/replayable
+
+volumes:
+  clickhouse_data:
+  postgres_data:
