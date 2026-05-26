@@ -1,0 +1,66 @@
+# Keep the docker build context small and reproducible.
+#
+# Docker reads this file relative to the build context root
+# (`context: ..` in infra/docker-compose.yml, i.e. the repo root).
+# Only the files the Dockerfile actually COPYs need to escape this
+# filter. Everything else slows builds and risks leaking unrelated
+# artifacts into the image.
+
+# Rust build artifacts (cargo target dir is multi-GB; the image
+# rebuilds inside the container anyway).
+**/target/
+**/*.rs.bk
+
+# Node / pnpm / npm caches (the proxy image does not need any JS).
+**/node_modules/
+**/.next/
+**/dist/
+**/build/
+**/.turbo/
+**/.pnpm-store/
+
+# Python virtualenvs and caches.
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
+**/.pyright_cache/
+**/*.egg-info/
+
+# Go build cache.
+**/go-build/
+
+# Test artifacts.
+**/coverage/
+**/.nyc_output/
+
+# Editor + OS junk.
+**/.git/
+**/.gitignore
+**/.github/
+**/.idea/
+**/.vscode/
+**/.DS_Store
+**/Thumbs.db
+
+# Local secrets and env files — never bake into an image.
+.env
+.env.*
+**/secrets/
+**/*.pem
+**/*.key
+
+# Docs and markdown that the proxy binary does not need at runtime.
+**/*.md
+docs/
+research/
+
+# Things only the other language workspaces use.
+go/
+python/
+ts/
+ui/
+
+# Infra config itself — the Dockerfile is fed in via -f, no need to
+# copy infra/ into the build context.
+infra/
