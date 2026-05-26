@@ -459,3 +459,136 @@
 ---
 
 *End of security review v0.1.0. Findings authored by the security-engineer persona; fixes to be applied by the senior software engineer on follow-up commits before requesting re-review.*
+
+---
+
+## Re-review (post-fix)
+
+Reviewed commits: `e07075f..18a9029` (6 commits)
+Reviewed by: security-engineer agent
+Date: 2026-05-26
+
+Full pass over the 6 follow-up commits and a clean test run against the new regression suite. Verification commands run from `/home/pranjald/project`:
+
+```
+git log a77e3c7..18a9029 --oneline
+cargo test -p replayable-proxy --test security   # 11 passed
+cargo test -p replayable-proxy --lib config      # 17 passed
+```
+
+### Finding status
+
+| ID | Severity      | Status   | Verification commit(s)                |
+|----|---------------|----------|---------------------------------------|
+| C1 | Critical      | RESOLVED | `e07075f`, `a241f4a`, `18a9029`       |
+| H1 | High          | RESOLVED | `e07075f`, `a241f4a`, `18a9029`       |
+| H2 | High          | RESOLVED | `e07075f`, `a241f4a`, `18a9029`       |
+| H3 | High (URL)    | RESOLVED with carve-outs — see N1 / N2 below | `e07075f`, `18a9029` |
+| H4 | High (listen) | RESOLVED | `e07075f`, `6aa8b80`, `18a9029`       |
+| M1 | Medium        | OPEN (deferred to v0.1.1 per original review's "merge with caveats" guidance) | — |
+| M2 | Medium        | OPEN (deferred to v0.1.1) | — |
+| M3 | Medium        | RESOLVED (folded into `a241f4a` — `O_NOFOLLOW` on `open_log_file`) | `a241f4a`, `18a9029` |
+| M4 | Medium        | OPEN (deferred to v0.1.1) | — |
+| L1 | Low           | Not changed (rebuttal — accepted as-is) | — |
+| L2 | Low           | Not changed (rebuttal — not a finding)  | — |
+| L3 | Low           | Not changed (positive observation)      | — |
+| L4 | Low           | OPEN (functional/forward-compat; deferred) | — |
+| L5 | Low           | Not changed (informational)             | — |
+| L6 | Low (`.dockerignore`) | RESOLVED | `52f795c` |
+| I1..I5 | Info      | Unchanged — informational confirmations | — |
+
+Verification details per finding:
+
+- **C1**: `REPLAYABLE_CAPTURE_CONTENT` exists with default `false` (`config.rs:67-70, 121-129`). When false, `model_calls[].input`, `.output`, and the new `request_headers`/`response_headers` maps are all empty (`proxy.rs:464-481`, `tests/security.rs::c1_default_capture_off_leaks_no_secrets`). When true, sensitive headers (`authorization`, `x-api-key`, `api-key`, `proxy-authorization`, `cookie`, `set-cookie`) are replaced with `[REDACTED]` (`proxy.rs:50-54, 131-144`). JSONL is opened with `mode(0o600)` and `custom_flags(libc::O_NOFOLLOW)` on Unix (`trace.rs:184-196`). Belt-and-braces: `proxy-authorization` is hop-by-hop and gets stripped *before* scrubbing, an even stronger guarantee. The 4 regression tests cover the leak path, scrubbing, mode, and symlink rejection; all fail without the fix.
+- **H1**: `REPLAYABLE_MAX_REQUEST_BYTES` exists, default `10 * 1024 * 1024` (`config.rs:75`). `http_body_util::Limited` wraps the body before any upstream call; oversize returns 413 with no upstream contact and no trace emitted (`proxy.rs:213-233`). `tests/security.rs::h1_oversized_request_returns_413_and_skips_upstream` asserts both: 413 response, zero hits on a wiremock `Counter`, and `traces.is_empty()`.
+- **H2**: `connect_timeout(config.connect_timeout)` and `read_timeout(config.read_timeout)` are set on the reqwest `ClientBuilder` (`main.rs:62-70`). Defaults are 10 s and 600 s (`config.rs:78, 81`). `tests/security.rs::h2_blackhole_upstream_trips_read_timeout` verifies a black-hole upstream surfaces as 502 within ~8 s and writes a `status=0` failure trace.
+- **H3**: `validate_upstream_url` (`config.rs:247-302`) blocks `169.254.169.254`, `metadata.google.internal`, `metadata.azure.com`, and `metadata.azure.internal` (the original review missed `.internal` — the SWE added the more common Azure spelling for free). Plaintext non-loopback is rejected unless `REPLAYABLE_UPSTREAM_ALLOW_PLAINTEXT=true`. Loopback accepts `127.0.0.1`, `localhost`, `[::1]`, `::1`, any `127.x.x.x` (`config.rs:304-307`). All four boundary tests pass. See N1/N2 below for residual IPv6 carve-outs.
+- **H4**: `DEFAULT_LISTEN = "127.0.0.1:8080"` (`config.rs:62`). `infra/docker-compose.yml:64` maps `127.0.0.1:8088:8080`. `tests/security.rs::h4_default_listen_is_loopback` asserts the default parses to a loopback IP. The Dockerfile keeps `0.0.0.0:8080` *inside the container* (correct — only the host-side mapping needs to be loopback-only).
+- **`.dockerignore`** (defensive): `**/*.crt`, `**/*.cer`, `**/*.p12`, `**/*.pfx`, `**/id_rsa*`, `**/id_ed25519*`, `**/known_hosts` are all present (`.dockerignore:51-58`).
+
+### New findings from re-review
+
+#### N1 — Low — `validate_upstream_url` does not block IPv6 link-local / unique-local hosts.
+
+- **Where:** `crates/replayable-proxy/src/config.rs:265-302` (`validate_upstream_url`) and the `BANNED_UPSTREAM_HOSTS` list at `:86-91`.
+- **Evidence:** The deny-list is string-equality against four named cloud-metadata hostnames. It does not consider IPv6 ranges:
+  - `https://[fe80::1]/` parses cleanly (`url::Url` yields `host_str() = "[fe80::1]"`), is not on the deny-list, and is not loopback, so the validator accepts it. IPv6 link-local (`fe80::/10`) can reach the host's local interfaces and is the IPv6 equivalent of the IPv4 link-local block the IMDS lives on. AWS's IPv6 IMDS endpoint is `fd00:ec2::254` (unique-local, `fc00::/7`), which is similarly accepted.
+  - The `*.internal` substring is not deny-listed beyond the four literal entries, so `https://metadata.gke.internal/` and similar future provider strings slip through. Low-probability operator-misconfig footgun, but cheap to fix.
+- **Impact:** Operator-side SSRF gadget. To exploit, an attacker needs the operator to set `REPLAYABLE_UPSTREAM_URL` to a hostile target — same threat model as the original H3, which we already rated High for that reason. This is Low because (a) the SWE's H3 fix already closed the obvious IPv4 / DNS-named footguns, and (b) IPv6 link-local would require either an `https://` URL (no public CA will sign for `fe80::*`, so TLS fails) or the `_ALLOW_PLAINTEXT=true` override. Both make the misconfiguration visible in ops review.
+- **Fix (defer to v0.1.1):**
+  ```rust
+  use std::net::IpAddr;
+  // After url::Url::parse and the named-host deny check:
+  if let Some(url::Host::Ipv6(addr)) = parsed.host() {
+      // RFC 4291 fe80::/10 link-local; RFC 4193 fc00::/7 unique-local.
+      let seg0 = addr.segments()[0];
+      let is_link_local = seg0 & 0xffc0 == 0xfe80;
+      let is_unique_local = seg0 & 0xfe00 == 0xfc00;
+      if (is_link_local || is_unique_local) && !IpAddr::V6(addr).is_loopback() {
+          return Err(ConfigError::Invalid {
+              name: ENV_UPSTREAM_URL,
+              reason: format!("IPv6 link-local / unique-local host `{addr}` is not allowed"),
+          });
+      }
+  }
+  ```
+- **Verification:** Add `h3_ipv6_link_local_rejected` and `h3_ipv6_unique_local_rejected` to `tests/security.rs`.
+
+#### N2 — Informational — IPv4-mapped IPv6 loopback (`::ffff:127.0.0.1`) is rejected as non-loopback for plaintext but accepted on HTTPS.
+
+- **Where:** `crates/replayable-proxy/src/config.rs:304-307` (`is_loopback_host`).
+- **Evidence:** `url::Url::parse("http://[::ffff:127.0.0.1]/")` yields `host_str = "[::ffff:7f00:1]"`, which `is_loopback_host` does not recognise. For plaintext this is fine (the URL is rejected by the no-plaintext-outside-loopback rule, which is the safer default). For `https://[::ffff:127.0.0.1]/` it is accepted. This is consistent with how a generic `https://10.0.0.5/` would behave (no SSRF block on private RFC1918 over TLS), so it is a uniform behaviour rather than a bug. **Documented for completeness; no fix required.**
+
+#### N3 — Informational — JSONL file-mode-on-restart caveat.
+
+- **Where:** `crates/replayable-proxy/src/trace.rs:184-196` (`open_log_file` on Unix).
+- **Evidence:** `OpenOptions::mode(0o600)` only applies when the kernel creates the file (the `O_CREAT` path). If a JSONL file already exists at `REPLAYABLE_LOG_PATH` with looser permissions (e.g. left over from a v0.1.0-pre run where the file was created `0o644` under the default umask), the v0.1.0 proxy will reopen it with the existing permissions intact. The test `c1_log_file_mode_is_owner_only` is explicit about this: it points to a *fresh* path under `tempdir()` to exercise the create branch.
+- **Impact:** Operationally meaningful only for upgrade paths from a pre-fix proxy that captured nothing useful (content was always off-by-default in v0.1.0). The threat model is "did a pre-existing world-readable JSONL inherit looser perms when the new fix lands" — for a deployment that ran the pre-fix binary it would be a no-op file (capture was off-by-default before, too, because the C1 fix predates v0.1.0 release) so there is nothing sensitive to leak. **Accept** with a comment in the threat-model section noting the caveat; if a future capture-on operator changes the file mode out-of-band, the proxy will not re-tighten it.
+- **Fix (optional, v0.1.1):** After open, call `fchmod` to force `0o600` regardless of existing permissions:
+  ```rust
+  #[cfg(unix)]
+  {
+      use std::os::unix::fs::PermissionsExt;
+      let mut perms = file.metadata().await?.permissions();
+      perms.set_mode(0o600);
+      file.set_permissions(perms).await?;
+  }
+  ```
+  This closes the upgrade-path edge.
+
+#### N4 — Low — header scrub list omits provider-specific credential names.
+
+- **Where:** `crates/replayable-proxy/src/proxy.rs:43-54` (`SCRUBBED_HEADER_NAMES`).
+- **Evidence:** Current list: `authorization`, `x-api-key`, `api-key`, `proxy-authorization`, `cookie`, `set-cookie`. Per spot-check #2, the following are not in the list and not otherwise covered:
+  - `anthropic-api-key` — **credential-bearing.** Some Anthropic SDK / proxy configurations use this header (Anthropic's official SDK uses `x-api-key`, which IS covered; but `anthropic-api-key` appears in third-party docs and middleware). **Recommend adding.**
+  - `x-goog-api-key` — **credential-bearing** (Google Generative Language API key). **Recommend adding.**
+  - `x-amz-security-token` — **credential-bearing** (SigV4 session token). Even though Bedrock is out-of-scope for v0.1.0, the proxy will see SigV4 traffic from any operator who points at Bedrock anyway, so scrubbing is cheap insurance. **Recommend adding.**
+  - `x-goog-user-project`, `openai-organization`, `openai-project` — identifying but not secret. Not strictly leakage of credentials; the operator's own org ID would land in a trace they own. **Skip — not worth the maintenance cost.**
+  - `azure-openai-api-key` — covered indirectly: Azure uses the literal header name `api-key` which IS scrubbed. **Already covered.**
+  - `x-amz-date`, `x-amz-content-sha256` — not secret (date and body hash). **Skip.**
+- **Impact:** Low. Body capture is off by default (C1), so the scrub list only matters when an operator explicitly opts in. In that mode, an `anthropic-api-key` or `x-goog-api-key` value would be written verbatim to the JSONL.
+- **Fix (defer to v0.1.1):** Extend `SCRUBBED_HEADER_NAMES` to include `anthropic-api-key`, `x-goog-api-key`, and `x-amz-security-token`. Update the README scrub-list documentation. Add tests asserting `[REDACTED]` for each.
+
+### Spot-check responses (SWE-requested)
+
+1. **IPv6 loopback boundary**: PARTIAL PASS. `::1`, `[::1]`, and `0:0:0:0:0:0:0:1` (normalises to `::1`) are accepted as loopback by `is_loopback_host`. `::ffff:127.0.0.1` is *not* treated as loopback (it is recognised under its canonical form `::ffff:7f00:1`, which is not in the match list). IPv6 link-local / unique-local (`fe80::/10`, `fc00::/7`) are NOT blocked — see **N1** above. Filed as Low.
+2. **Header scrub breadth**: PARTIAL. The six headers the SWE listed are all correctly scrubbed and tested. Missing provider-specific credential headers (`anthropic-api-key`, `x-goog-api-key`, `x-amz-security-token`) — see **N4** above. Filed as Low. The identifying-only headers (`openai-organization`, `x-goog-user-project`) are not worth the maintenance burden; skip.
+3. **File-mode-on-restart caveat**: ACCEPT with a documentation note. See **N3** above. The threat is bounded by the secure-by-default capture behaviour: an existing pre-fix JSONL contains no body content, so even if its permissions are looser than `0o600`, there is nothing sensitive to leak. The optional `fchmod`-on-open fix is a v0.1.1 improvement, not a blocker.
+
+### Merge verdict
+
+**CLEAR WITH NOTES**
+
+The five merge-blocking findings (C1, H1, H2, H3, H4) are correctly resolved. The defensive `.dockerignore` recommendation is also resolved. M3 was folded in for free. All 28 unit + 11 security regression tests pass. The implementation matches the original review's "Fix" prescriptions closely — bonus credit for catching `metadata.azure.internal` (review only listed `metadata.azure.com`) and for the strictly-safer `proxy-authorization`-stripped-as-hop-by-hop guarantee.
+
+**Notes (small follow-ups for v0.1.1, none blocking merge):**
+
+- **N1** — Extend SSRF deny-list to IPv6 link-local (`fe80::/10`) and unique-local (`fc00::/7`) ranges. Low severity, ~10 lines of code, sketch provided above.
+- **N3** — Add a defensive `fchmod(0o600)` after open to cover the file-mode-on-restart edge case. One-time upgrade-path concern only.
+- **N4** — Extend `SCRUBBED_HEADER_NAMES` with `anthropic-api-key`, `x-goog-api-key`, `x-amz-security-token`. Low.
+- **M1, M2, M4** — Per-stream concurrency cap, per-stream aggregate cap, audit-grade dropped-trace metric. These were explicitly listed as "merge with caveats, defer to v0.1.1" in the original review and remain so.
+- **L4** — `String::from_utf8_lossy` base64 fallback for forward-compat byte-exact replay.
+
+These follow-ups should be tracked as v0.1.1 issues (or one combined "security follow-ups" issue) before the v0.1.1 milestone closes.
+
+*End of re-review. v0.1.0 is clear for merge to `feature/l4-proxy-mvp` → main. DevOps and Writer agents may proceed.*
