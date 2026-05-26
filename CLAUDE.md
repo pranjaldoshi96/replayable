@@ -146,20 +146,41 @@ One agent's deliverable = one commit (or a small series). Don't pile a PM doc, a
 
 ## 5. Pre-commit validation (run before EVERY commit)
 
-Run through this checklist. If any item fails, fix before committing.
+Replayable is polyglot. The repo-root `Makefile` orchestrates everything; use `make check` as the single entry point.
 
-- [ ] **Tests pass** locally (`npm test` / `pytest` / project equivalent)
-- [ ] **Lint and format clean** (`npm run lint`, `ruff`, `prettier --check`, etc.)
-- [ ] **Type checks pass** (`tsc --noEmit`, `mypy`, etc.)
-- [ ] **No debug leftovers**: `console.log`, `print()`, `debugger`, `pdb.set_trace()`, commented-out code
+### The checklist
+
+- [ ] **`make check` passes** locally (orchestrates the per-language tools below)
+- [ ] **No debug leftovers**: grep your diff for `console.log`, `print(`, `debugger`, `pdb.set_trace()`, `dbg!(`, commented-out code
 - [ ] **No secrets**: API keys, tokens, passwords, `.env` contents, private URLs — grep your diff
 - [ ] **No unrelated changes** mixed in (revert formatting drift in untouched files)
 - [ ] **Diff self-reviewed** — read every line as if reviewing a stranger's PR
 - [ ] **Tests added or updated** to cover the change
-- [ ] **Docs updated** if user-visible behavior changed
-- [ ] **Branch is up-to-date** with `main` (`git fetch && git rebase origin/main` or merge)
+- [ ] **Docs updated** if user-visible behavior changed (PRD, ARCHITECTURE, ADR, README)
+- [ ] **Branch up-to-date** with `main` (`git fetch && git rebase origin/main`)
+
+### Per-language validation (what `make check` runs)
+
+| Lang | Lint | Format | Types | Tests |
+|---|---|---|---|---|
+| Rust       | `cargo clippy -- -D warnings` | `cargo fmt --check`          | (clippy includes) | `cargo test --workspace` |
+| Go         | `go vet ./...`                | `gofmt -l .`                 | (vet includes)    | `go test ./...`          |
+| Python     | `uv run ruff check`           | `uv run ruff format --check` | `uv run pyright`  | `uv run pytest`          |
+| TypeScript | (eslint TBD)                  | (prettier TBD)               | `pnpm typecheck`  | `pnpm test`              |
+| Next.js UI | `pnpm lint` (next lint)       | (prettier TBD)               | `pnpm typecheck`  | `pnpm test`              |
+
+If you're only touching one language, run `make check-<lang>` (e.g. `make check-python`). CI runs `make check` in full.
 
 Never use `--no-verify` to skip hooks. If a hook fails, fix the underlying issue.
+
+### Toolchain prerequisites
+
+If a target reports a missing tool, install it:
+- **Rust** (stable + rustfmt + clippy) — https://rustup.rs
+- **Go 1.22+** — https://go.dev/dl
+- **uv** (Python package manager) — `curl -LsSf https://astral.sh/uv/install.sh | sh` or https://astral.sh/uv
+- **pnpm 9+** — `npm install -g pnpm` (requires Node 20+)
+- **Docker** (for `infra/docker-compose.yml`) — https://docs.docker.com/get-docker
 
 ---
 
