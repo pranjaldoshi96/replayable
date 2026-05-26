@@ -32,8 +32,23 @@ async fn main() -> ExitCode {
         upstream = %config.upstream_url,
         log_path = ?config.log_path,
         log_channel_capacity = config.log_channel_capacity,
+        capture_content = config.capture_content,
+        max_request_bytes = config.max_request_bytes,
+        connect_timeout_secs = config.connect_timeout.as_secs(),
+        read_timeout_secs = config.read_timeout.as_secs(),
         "configuration loaded",
     );
+
+    if config.capture_content {
+        // Security review C1, item 4: log a prominent warning on every
+        // boot where content capture is enabled. Operators occasionally
+        // flip this on for debugging and forget; the warning makes that
+        // visible in stdout / their log aggregator.
+        warn!(
+            log_path = ?config.log_path,
+            "CONTENT CAPTURE ENABLED — prompts, completions, and tool arguments will be written verbatim to the JSONL trace log. This may include user-pasted secrets and PII.",
+        );
+    }
 
     let pipeline = match spawn_pipeline(&config.log_path, config.log_channel_capacity).await {
         Ok(p) => p,
@@ -46,6 +61,13 @@ async fn main() -> ExitCode {
     let client = match reqwest::Client::builder()
         .pool_idle_timeout(Some(Duration::from_secs(90)))
         .pool_max_idle_per_host(32)
+        // Security review H2: cap connect and per-read durations so a
+        // trickle-stream or unreachable upstream cannot pin a request
+        // handler indefinitely. The read timer resets on every chunk, so
+        // healthy streaming responses are unaffected — only prolonged
+        // silence trips it.
+        .connect_timeout(config.connect_timeout)
+        .read_timeout(config.read_timeout)
         .build()
     {
         Ok(c) => c,
@@ -59,6 +81,8 @@ async fn main() -> ExitCode {
         upstream_url: config.upstream_url.clone(),
         client,
         trace_writer: pipeline.writer.clone(),
+        capture_content: config.capture_content,
+        max_request_bytes: config.max_request_bytes,
     });
 
     let listener = match tokio::net::TcpListener::bind(config.listen).await {

@@ -51,6 +51,8 @@ impl TestRig {
             upstream_url: upstream_base.clone(),
             client,
             trace_writer: pipeline.writer,
+            capture_content: false,
+            max_request_bytes: 10 * 1024 * 1024,
         });
 
         let app = router(state);
@@ -214,7 +216,14 @@ async fn passes_through_streaming_sse_response() {
     assert!(call.streamed, "trace must mark streamed=true");
     assert_eq!(call.status, 200);
     assert_eq!(call.model.as_deref(), Some("gpt-stream"));
-    assert!(call.output.contains("[DONE]"));
+    // With the default `capture_content = false` (security review C1),
+    // the body is intentionally not persisted. The byte-exact wire body
+    // delivered to the client is asserted above; captured-body fidelity
+    // is exercised by `tests/security.rs` with capture explicitly on.
+    assert!(
+        call.output.is_empty(),
+        "default trace must not capture body"
+    );
 }
 
 #[tokio::test]
@@ -306,6 +315,8 @@ async fn healthz_returns_ok_when_upstream_is_unreachable() {
         upstream_url: upstream_base,
         client,
         trace_writer: pipeline.writer.clone(),
+        capture_content: false,
+        max_request_bytes: 10 * 1024 * 1024,
     });
     let app = router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

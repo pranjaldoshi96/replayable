@@ -19,7 +19,7 @@ use futures::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::common::ProxyRig;
+use crate::common::{ProxyRig, RigOptions};
 
 /// Spawn an upstream that, on the first POST, writes an SSE response in
 /// `chunks` with `delay` between successive writes. Returns the base URL
@@ -124,7 +124,17 @@ async fn delayed_sse_chunks_reach_client_with_preserved_gaps() {
     let (upstream_base, upstream_task) =
         spawn_delayed_sse_upstream(vec![chunk_a, chunk_b, chunk_c, chunk_done], gap).await;
 
-    let rig = ProxyRig::start(&upstream_base, 64).await;
+    // This test asserts the trace captured the aggregated SSE body
+    // (including the `[DONE]` sentinel). Content capture is opt-in by
+    // default (security review C1), so explicitly enable it here.
+    let rig = ProxyRig::start_with(
+        &upstream_base,
+        RigOptions {
+            capture_content: true,
+            ..RigOptions::new()
+        },
+    )
+    .await;
 
     let client = reqwest::Client::builder()
         // Critical: no response buffering on the client side either, so the

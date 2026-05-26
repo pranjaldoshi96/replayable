@@ -74,6 +74,8 @@ async fn start_proxy(upstream_base: String) -> String {
         upstream_url: upstream_base,
         client,
         trace_writer: pipeline.writer,
+        capture_content: false,
+        max_request_bytes: 10 * 1024 * 1024,
     });
     let app = router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");

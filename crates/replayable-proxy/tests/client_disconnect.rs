@@ -25,7 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-use crate::common::ProxyRig;
+use crate::common::{ProxyRig, RigOptions};
 
 /// Spawn a slow upstream that writes SSE chunks every `delay`. It will
 /// keep writing until the socket breaks; when the write fails it sends
@@ -108,7 +108,17 @@ async fn spawn_slow_sse_upstream(
 async fn client_disconnect_mid_stream_closes_upstream_and_records_partial_trace() {
     let gap = Duration::from_millis(80);
     let (upstream_base, breakage_rx, upstream_task) = spawn_slow_sse_upstream(gap).await;
-    let rig = ProxyRig::start(&upstream_base, 64).await;
+    // Content capture is opt-in (security C1). This test inspects the
+    // captured stream payload to prove partial aggregation worked, so we
+    // explicitly enable it here.
+    let rig = ProxyRig::start_with(
+        &upstream_base,
+        RigOptions {
+            capture_content: true,
+            ..RigOptions::new()
+        },
+    )
+    .await;
 
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(0)

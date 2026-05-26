@@ -6,6 +6,7 @@
 //! See ADR-0001 §2 for the schema this module emits and PRD §8.5 for the
 //! "fail open" non-negotiable.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -60,10 +61,21 @@ pub struct ModelCall {
     pub provider: String,
     /// Model name extracted from the request body, when present.
     pub model: Option<String>,
-    /// Raw client request body (UTF-8 lossy decode).
+    /// Raw client request body (UTF-8 lossy decode). Empty when
+    /// `REPLAYABLE_CAPTURE_CONTENT` is `false` (the secure default).
     pub input: String,
-    /// Raw upstream response body / aggregated stream output (UTF-8 lossy decode).
+    /// Raw upstream response body / aggregated stream output (UTF-8 lossy
+    /// decode). Empty when `REPLAYABLE_CAPTURE_CONTENT` is `false`.
     pub output: String,
+    /// Request headers as sent upstream, with auth-sensitive values
+    /// scrubbed (see security review C1). Populated only when content
+    /// capture is enabled.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub request_headers: BTreeMap<String, String>,
+    /// Response headers received from the upstream, with cookie-style
+    /// values scrubbed. Populated only when content capture is enabled.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub response_headers: BTreeMap<String, String>,
     /// HTTP status code of the upstream response.
     pub status: u16,
     /// Token usage reported by the upstream, when present.
@@ -139,17 +151,18 @@ pub struct TracePipeline {
 /// every [`FLUSH_BATCH_SIZE`] records or every [`FLUSH_INTERVAL`], whichever
 /// comes first. Parent directories must already exist.
 ///
+/// On Unix the file is created with mode `0o600` (owner-only read/write)
+/// and `O_NOFOLLOW` so the writer refuses to follow a pre-placed symlink
+/// to a target the operator did not intend (security review C1 + M3).
+///
 /// # Errors
-/// Returns an error when the log file cannot be opened.
+/// Returns an error when the log file cannot be opened. On Unix this
+/// includes `ELOOP` when `log_path` is itself a symlink.
 pub async fn spawn_pipeline(log_path: &Path, capacity: usize) -> std::io::Result<TracePipeline> {
     let (tx, rx) = mpsc::channel::<AgentTrace>(capacity);
     let dropped = Arc::new(AtomicU64::new(0));
 
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .await?;
+    let file = open_log_file(log_path).await?;
     let writer = BufWriter::new(file);
 
     let task = tokio::spawn(writer_loop(rx, writer));
@@ -161,6 +174,34 @@ pub async fn spawn_pipeline(log_path: &Path, capacity: usize) -> std::io::Result
         },
         task,
     })
+}
+
+/// Open the JSONL log file with the platform-appropriate hardening flags.
+///
+/// Unix builds set mode `0o600` and `O_NOFOLLOW`; non-Unix builds fall
+/// back to the portable `create + append` open (mode is determined by the
+/// platform's umask equivalent).
+#[cfg(unix)]
+async fn open_log_file(log_path: &Path) -> std::io::Result<tokio::fs::File> {
+    // Note: tokio's `OpenOptions` exposes `mode` and `custom_flags` as
+    // inherent methods on Unix builds, so we do not need to import the
+    // `std::os::unix::fs::OpenOptionsExt` trait.
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(log_path)
+        .await
+}
+
+#[cfg(not(unix))]
+async fn open_log_file(log_path: &Path) -> std::io::Result<tokio::fs::File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .await
 }
 
 async fn writer_loop(mut rx: mpsc::Receiver<AgentTrace>, mut buf: BufWriter<tokio::fs::File>) {
@@ -247,6 +288,8 @@ mod tests {
                 model: Some("gpt-test".to_string()),
                 input: "{\"hi\":1}".to_string(),
                 output: "{\"bye\":2}".to_string(),
+                request_headers: BTreeMap::new(),
+                response_headers: BTreeMap::new(),
                 status: 200,
                 tokens: Some(TokenUsage {
                     input_tokens: Some(10),

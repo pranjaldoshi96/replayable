@@ -10,6 +10,7 @@
 //! they arrive; the trace pipeline sees the fully-aggregated text once
 //! the upstream stream ends.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -22,7 +23,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::StreamExt;
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, LengthLimitError, Limited};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -37,6 +38,21 @@ pub const PROXY_PATH: &str = "/v1/chat/completions";
 /// Schema version emitted on every trace record.
 pub const SCHEMA_VERSION: &str = "0.1.0";
 
+/// Placeholder substituted for the value of any sensitive header in the
+/// trace log when content capture is enabled.
+const REDACTED: &str = "[REDACTED]";
+
+/// Header names whose values are scrubbed before being written to the
+/// trace log. Case-insensitive; see security review C1.
+const SCRUBBED_HEADER_NAMES: &[&str] = &[
+    "authorization",
+    "x-api-key",
+    "api-key",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+];
+
 /// Shared application state passed through axum's [`State`] extractor.
 #[derive(Clone)]
 pub struct AppState {
@@ -46,6 +62,12 @@ pub struct AppState {
     pub client: reqwest::Client,
     /// Trace writer the request handler submits to.
     pub trace_writer: TraceWriter,
+    /// When `true`, write request/response bodies and (scrubbed) headers
+    /// into the trace log. When `false`, only metadata is captured.
+    pub capture_content: bool,
+    /// Upper bound (bytes) on accepted request bodies. Requests above
+    /// this are rejected with HTTP 413 before the upstream is dialled.
+    pub max_request_bytes: usize,
 }
 
 /// Hop-by-hop headers that must not be forwarded per RFC 7230 §6.1.
@@ -98,6 +120,26 @@ fn forwardable_response_headers(src: &HeaderMap) -> HeaderMap {
         }
     }
     out
+}
+
+/// Serialise a [`HeaderMap`] into a flat `name -> value` map with the
+/// names in [`SCRUBBED_HEADER_NAMES`] replaced by [`REDACTED`].
+///
+/// Multi-valued headers are joined with `, ` per RFC 7230 §3.2.2.
+/// Header name lookups are case-insensitive (`HeaderName` is normalised
+/// to lower-case by hyper/http on parse).
+fn scrub_headers(src: &HeaderMap) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (k, v) in src {
+        let name = k.as_str().to_ascii_lowercase();
+        let value = if SCRUBBED_HEADER_NAMES.iter().any(|s| *s == name) {
+            REDACTED.to_string()
+        } else {
+            v.to_str().unwrap_or("[non-utf8]").to_string()
+        };
+        out.entry(name).or_default().push(value);
+    }
+    out.into_iter().map(|(k, vs)| (k, vs.join(", "))).collect()
 }
 
 /// Extract the model name from a JSON request body if present.
@@ -169,9 +211,26 @@ pub async fn forward(State(state): State<Arc<AppState>>, req: Request<Body>) -> 
     // Buffer the request body. Chat-completion bodies are JSON, small (typically
     // <100 KB), so a single-pass collect is correct and lets us extract the
     // model name for the trace without re-parsing the stream.
-    let body_bytes = match body.collect().await {
+    //
+    // `Limited` enforces `state.max_request_bytes` (security review H1).
+    // Requests above the cap are rejected with HTTP 413 *before* we dial
+    // the upstream and *before* any trace is emitted, so an attacker
+    // cannot use oversized requests to either DoS the proxy or pollute
+    // the audit log.
+    let limited = Limited::new(body, state.max_request_bytes);
+    let body_bytes = match limited.collect().await {
         Ok(c) => c.to_bytes(),
         Err(e) => {
+            if e.downcast_ref::<LengthLimitError>().is_some() {
+                warn!(
+                    max = state.max_request_bytes,
+                    "rejecting oversized request body"
+                );
+                return json_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body exceeds configured limit",
+                );
+            }
             warn!(error = %e, "failed to read request body");
             return json_error(StatusCode::BAD_REQUEST, "could not read request body");
         }
@@ -183,7 +242,7 @@ pub async fn forward(State(state): State<Arc<AppState>>, req: Request<Body>) -> 
     let upstream_resp = state
         .client
         .post(&url)
-        .headers(req_headers)
+        .headers(req_headers.clone())
         .body(body_bytes.clone())
         .send()
         .await;
@@ -192,7 +251,7 @@ pub async fn forward(State(state): State<Arc<AppState>>, req: Request<Body>) -> 
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "upstream request failed");
-            emit_trace_failure(&state, &body_bytes, started, &started_at);
+            emit_trace_failure(&state, &body_bytes, &req_headers, started, &started_at);
             return json_error(StatusCode::BAD_GATEWAY, "upstream request failed");
         }
     };
@@ -205,6 +264,7 @@ pub async fn forward(State(state): State<Arc<AppState>>, req: Request<Body>) -> 
             state.clone(),
             response,
             body_bytes,
+            req_headers,
             started,
             started_at,
             status,
@@ -215,6 +275,7 @@ pub async fn forward(State(state): State<Arc<AppState>>, req: Request<Body>) -> 
             &state,
             response,
             &body_bytes,
+            &req_headers,
             started,
             &started_at,
             status,
@@ -234,10 +295,12 @@ fn is_sse_response(headers: &HeaderMap) -> bool {
         .is_some_and(|m| m.eq_ignore_ascii_case("text/event-stream"))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_buffered(
     state: &AppState,
     response: reqwest::Response,
     request_body: &Bytes,
+    request_headers: &HeaderMap,
     started: Instant,
     started_at: &str,
     status: StatusCode,
@@ -247,7 +310,7 @@ async fn forward_buffered(
         Ok(b) => b,
         Err(e) => {
             warn!(error = %e, "failed to read upstream body");
-            emit_trace_failure(state, request_body, started, started_at);
+            emit_trace_failure(state, request_body, request_headers, started, started_at);
             return json_error(StatusCode::BAD_GATEWAY, "failed to read upstream body");
         }
     };
@@ -256,6 +319,8 @@ async fn forward_buffered(
         state,
         request_body,
         &body_bytes_out,
+        request_headers,
+        &resp_headers,
         status.as_u16(),
         false,
         started,
@@ -284,10 +349,12 @@ async fn forward_buffered(
 /// driven by a bounded mpsc that the task writes into chunk-by-chunk. The
 /// trace is emitted **after** the upstream stream terminates so the request
 /// hot path never waits on capture work.
+#[allow(clippy::too_many_arguments)]
 fn forward_streaming(
     state: Arc<AppState>,
     response: reqwest::Response,
     request_body: Bytes,
+    request_headers: HeaderMap,
     started: Instant,
     started_at: String,
     status: StatusCode,
@@ -295,6 +362,7 @@ fn forward_streaming(
 ) -> Response {
     let (chunk_tx, chunk_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
+    let resp_headers_for_trace = resp_headers.clone();
     tokio::spawn(async move {
         let mut stream = response.bytes_stream();
         let mut aggregated: Vec<u8> = Vec::with_capacity(4096);
@@ -322,6 +390,8 @@ fn forward_streaming(
             &state,
             &request_body,
             &aggregated,
+            &request_headers,
+            &resp_headers_for_trace,
             status.as_u16(),
             true,
             started,
@@ -372,10 +442,13 @@ impl<T> futures::Stream for ReceiverStream<T> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_trace(
     state: &AppState,
     request_body: &Bytes,
     response_body: &[u8],
+    request_headers: &HeaderMap,
+    response_headers: &HeaderMap,
     status: u16,
     streamed: bool,
     started: Instant,
@@ -388,6 +461,24 @@ fn emit_trace(
     } else {
         extract_token_usage(response_body)
     };
+    // Gate body capture on the explicit operator opt-in (security review
+    // C1). Token-usage parsing above runs on the actual response body so
+    // counts remain accurate even when the body itself is not persisted.
+    let (input, output, req_hdrs, resp_hdrs) = if state.capture_content {
+        (
+            String::from_utf8_lossy(request_body).into_owned(),
+            String::from_utf8_lossy(response_body).into_owned(),
+            scrub_headers(request_headers),
+            scrub_headers(response_headers),
+        )
+    } else {
+        (
+            String::new(),
+            String::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+    };
     let trace = AgentTrace {
         trace_id: new_trace_id(),
         timestamp_start: started_at.to_string(),
@@ -398,8 +489,10 @@ fn emit_trace(
         model_calls: vec![ModelCall {
             provider: provider_from_url(&state.upstream_url),
             model,
-            input: String::from_utf8_lossy(request_body).into_owned(),
-            output: String::from_utf8_lossy(response_body).into_owned(),
+            input,
+            output,
+            request_headers: req_hdrs,
+            response_headers: resp_hdrs,
             status,
             tokens,
             streamed,
@@ -409,6 +502,22 @@ fn emit_trace(
     state.trace_writer.submit(trace);
 }
 
-fn emit_trace_failure(state: &AppState, request_body: &Bytes, started: Instant, started_at: &str) {
-    emit_trace(state, request_body, b"", 0, false, started, started_at);
+fn emit_trace_failure(
+    state: &AppState,
+    request_body: &Bytes,
+    request_headers: &HeaderMap,
+    started: Instant,
+    started_at: &str,
+) {
+    emit_trace(
+        state,
+        request_body,
+        b"",
+        request_headers,
+        &HeaderMap::new(),
+        0,
+        false,
+        started,
+        started_at,
+    );
 }
