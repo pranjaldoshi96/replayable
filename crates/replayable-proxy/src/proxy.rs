@@ -5,8 +5,10 @@
 //! upstream response to the client byte-for-byte, and emits a single
 //! canonical [`AgentTrace`] record to the writer pipeline.
 //!
-//! This module handles non-streaming responses; streaming SSE pass-through
-//! is layered on in a follow-up commit.
+//! Streaming responses (upstream `Content-Type: text/event-stream`) flow
+//! through a tokio mpsc bridge so chunks are forwarded to the client as
+//! they arrive; the trace pipeline sees the fully-aggregated text once
+//! the upstream stream ends.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,13 +16,15 @@ use std::time::Instant;
 use axum::{
     body::Body,
     extract::State,
-    http::{HeaderMap, HeaderName, Method, Request, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use bytes::Bytes;
+use futures::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::Value;
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::trace::{
@@ -188,23 +192,66 @@ pub async fn forward(State(state): State<Arc<AppState>>, req: Request<Body>) -> 
     let status = response.status();
     let resp_headers = forwardable_response_headers(response.headers());
 
+    if is_sse_response(&resp_headers) {
+        forward_streaming(
+            state.clone(),
+            response,
+            body_bytes,
+            started,
+            started_at,
+            status,
+            resp_headers,
+        )
+    } else {
+        forward_buffered(
+            &state,
+            response,
+            &body_bytes,
+            started,
+            &started_at,
+            status,
+            resp_headers,
+        )
+        .await
+    }
+}
+
+/// True when the upstream signalled an SSE stream.
+fn is_sse_response(headers: &HeaderMap) -> bool {
+    headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(';').next())
+        .map(str::trim)
+        .is_some_and(|m| m.eq_ignore_ascii_case("text/event-stream"))
+}
+
+async fn forward_buffered(
+    state: &AppState,
+    response: reqwest::Response,
+    request_body: &Bytes,
+    started: Instant,
+    started_at: &str,
+    status: StatusCode,
+    resp_headers: HeaderMap,
+) -> Response {
     let body_bytes_out = match response.bytes().await {
         Ok(b) => b,
         Err(e) => {
             warn!(error = %e, "failed to read upstream body");
-            emit_trace_failure(&state, &body_bytes, started, &started_at);
+            emit_trace_failure(state, request_body, started, started_at);
             return json_error(StatusCode::BAD_GATEWAY, "failed to read upstream body");
         }
     };
 
     emit_trace(
-        &state,
-        &body_bytes,
+        state,
+        request_body,
         &body_bytes_out,
         status.as_u16(),
         false,
         started,
-        &started_at,
+        started_at,
     );
 
     let mut builder = Response::builder().status(status);
@@ -220,6 +267,101 @@ pub async fn forward(State(state): State<Arc<AppState>>, req: Request<Body>) -> 
                 "failed to build response",
             )
         })
+}
+
+/// Forward a streaming upstream response back to the client and tee the
+/// aggregated bytes to the trace pipeline once the stream ends.
+///
+/// The forward path is the spawned task; the client's response body is
+/// driven by a bounded mpsc that the task writes into chunk-by-chunk. The
+/// trace is emitted **after** the upstream stream terminates so the request
+/// hot path never waits on capture work.
+fn forward_streaming(
+    state: Arc<AppState>,
+    response: reqwest::Response,
+    request_body: Bytes,
+    started: Instant,
+    started_at: String,
+    status: StatusCode,
+    mut resp_headers: HeaderMap,
+) -> Response {
+    let (chunk_tx, chunk_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+
+    tokio::spawn(async move {
+        let mut stream = response.bytes_stream();
+        let mut aggregated: Vec<u8> = Vec::with_capacity(4096);
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(bytes) => {
+                    aggregated.extend_from_slice(&bytes);
+                    if chunk_tx.send(Ok(bytes)).await.is_err() {
+                        // Client disconnected; stop reading upstream but still
+                        // emit the trace below with what we collected.
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "upstream stream error");
+                    let _ = chunk_tx
+                        .send(Err(std::io::Error::other(e.to_string())))
+                        .await;
+                    break;
+                }
+            }
+        }
+        drop(chunk_tx);
+        emit_trace(
+            &state,
+            &request_body,
+            &aggregated,
+            status.as_u16(),
+            true,
+            started,
+            &started_at,
+        );
+    });
+
+    // SSE hygiene per ADR-0003: disable any intermediary buffering / caching
+    // so the client gets each chunk as it arrives.
+    resp_headers.insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    resp_headers.insert(
+        HeaderName::from_static("cache-control"),
+        HeaderValue::from_static("no-transform, no-cache"),
+    );
+
+    let stream = ReceiverStream { inner: chunk_rx };
+    let body = Body::from_stream(stream);
+
+    let mut builder = Response::builder().status(status);
+    if let Some(headers) = builder.headers_mut() {
+        *headers = resp_headers;
+    }
+    builder.body(body).unwrap_or_else(|e| {
+        warn!(error = %e, "failed to build streaming response");
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to build streaming response",
+        )
+    })
+}
+
+/// Adapter turning a tokio mpsc Receiver into a `futures::Stream` without an
+/// extra crate dependency.
+struct ReceiverStream<T> {
+    inner: mpsc::Receiver<T>,
+}
+
+impl<T> futures::Stream for ReceiverStream<T> {
+    type Item = T;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.inner.poll_recv(cx)
+    }
 }
 
 fn emit_trace(
