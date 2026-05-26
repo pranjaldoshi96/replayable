@@ -71,22 +71,30 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 }
 
 /// Filter request headers down to ones safe to forward upstream.
+///
+/// Iterating `HeaderMap` yields one item per stored value, so multi-valued
+/// headers (e.g. multiple `Set-Cookie`, `Cookie`, `Via`, or `Accept`
+/// lines) are visited once per value. Using `append` here preserves every
+/// value; `insert` would silently keep only the last one.
 fn forwardable_request_headers(src: &HeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (k, v) in src {
         if !is_hop_by_hop(k) {
-            out.insert(k.clone(), v.clone());
+            out.append(k.clone(), v.clone());
         }
     }
     out
 }
 
 /// Filter response headers down to ones safe to forward back to the client.
+///
+/// See [`forwardable_request_headers`] for why `append` (not `insert`) is
+/// the only correct call here.
 fn forwardable_response_headers(src: &HeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (k, v) in src {
         if !is_hop_by_hop(k) {
-            out.insert(k.clone(), v.clone());
+            out.append(k.clone(), v.clone());
         }
     }
     out
