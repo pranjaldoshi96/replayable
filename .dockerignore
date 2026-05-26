@@ -44,11 +44,20 @@
 **/Thumbs.db
 
 # Local secrets and env files — never bake into an image.
+# Even when the Dockerfile does not COPY them, build contexts can be
+# inspected via cache layers, so defence in depth filters them here.
 .env
 .env.*
 **/secrets/
 **/*.pem
 **/*.key
+**/*.crt
+**/*.cer
+**/*.p12
+**/*.pfx
+**/id_rsa*
+**/id_ed25519*
+**/known_hosts
 
 # Docs and markdown that the proxy binary does not need at runtime.
 **/*.md
