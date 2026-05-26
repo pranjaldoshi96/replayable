@@ -1,0 +1,37 @@
+[project]
+name = "replayable-workspace"
+version = "0.0.1"
+description = "Replayable Python workspace root"
+requires-python = ">=3.11"
+
+[tool.uv.workspace]
+members = [
+    "sdk",
+    "server",
+    "adapters/langgraph",
+    "adapters/crewai",
+    "adapters/openai-agents",
+    "adapters/llamaindex",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+    "ruff>=0.6",
+    "pyright>=1.1",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+
+[tool.pyright]
+typeCheckingMode = "strict"
+pythonVersion = "3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["sdk/tests", "server/tests"]
