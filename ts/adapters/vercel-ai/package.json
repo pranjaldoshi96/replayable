@@ -1,0 +1,15 @@
+{
+  "name": "@replayable/adapter-vercel-ai",
+  "version": "0.0.1",
+  "description": "Replayable L2 adapter for the Vercel AI SDK",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "@replayable/sdk": "workspace:*"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}
