@@ -1,0 +1,70 @@
+name: Bug report
+description: A reproducible defect in capture, replay, eval, or UI
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Replayable version
+      placeholder: "v0.0.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - L4 proxy (Rust)
+        - OTel ingest collector (Go)
+        - Replay engine
+        - Eval engine
+        - API server (Python)
+        - Web UI (Next.js)
+        - CLI (agentctl)
+        - Python SDK
+        - TypeScript SDK
+        - L2 adapter (specify in description)
+        - L3 CLI shim (specify in description)
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Numbered steps. Include exact commands, framework + version, and a minimal example.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      placeholder: |
+        OS:
+        Language + version:
+        Framework + version:
+        Deployment mode (Docker Compose / Kubernetes / local):
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or trace excerpts
+      render: text

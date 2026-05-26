@@ -1,0 +1,26 @@
+# Default to LF line endings
+* text=auto eol=lf
+
+# Force CRLF for Windows scripts
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar.gz binary
+*.woff binary
+*.woff2 binary
+
+# Generated / lock files — exclude from diff and language stats
+Cargo.lock linguist-generated
+pnpm-lock.yaml linguist-generated
+package-lock.json linguist-generated
+uv.lock linguist-generated
+go.sum linguist-generated

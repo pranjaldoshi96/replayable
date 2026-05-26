@@ -1,0 +1,93 @@
+# OS
+.DS_Store
+Thumbs.db
+*~
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Rust
+target/
+**/*.rs.bk
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work.sum
+vendor/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright_cache/
+.tox/
+.coverage
+htmlcov/
+
+# Node / TypeScript
+node_modules/
+.pnpm-store/
+.pnpm-debug.log*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.turbo/
+*.tsbuildinfo
+
+# Next.js
+.next/
+out/
+
+# Build outputs
+dist/
+
+# Test artifacts
+coverage/
+.nyc_output/
+*.lcov
+
+# Local secrets and tokens — never commit
+*.pem
+*.key
+secrets/

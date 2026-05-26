@@ -1,0 +1,32 @@
+name: Feature request
+description: Propose new functionality or an enhancement
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Customer problem
+      description: Who has this problem, and what are they trying to do today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: impact
+    attributes:
+      label: Who benefits and how much?
+      placeholder: |
+        User tier: Tier-1 startup / Tier-2 enterprise / Tier-3 individual dev
+        Frequency:
+        Impact if not solved:
+    validations:
+      required: true
