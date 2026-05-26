@@ -282,6 +282,121 @@ async fn upstream_failure_records_trace_and_returns_502() {
 }
 
 #[tokio::test]
+async fn healthz_returns_ok_when_upstream_is_unreachable() {
+    // Build a rig whose upstream URL points at an unbound port (we
+    // create a listener, grab its addr, then drop the listener so the
+    // port is unbound by the time the proxy tries to dial it). /healthz
+    // must remain 200 because proxy liveness is independent of upstream
+    // reachability — that's the contract the orchestrator depends on
+    // to differentiate "proxy is dead" from "upstream provider is dead".
+    let dead_port = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        drop(l);
+        a.port()
+    };
+    let upstream_base = format!("http://127.0.0.1:{dead_port}");
+
+    let log_file = tempfile::NamedTempFile::new().unwrap();
+    let log_path = log_file.path().to_path_buf();
+    let pipeline = spawn_pipeline(&log_path, 16).await.unwrap();
+
+    let client = reqwest::Client::builder().build().unwrap();
+    let state = Arc::new(AppState {
+        upstream_url: upstream_base,
+        client,
+        trace_writer: pipeline.writer.clone(),
+    });
+    let app = router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_base = format!("http://{}", listener.local_addr().unwrap());
+    let (sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = sd_rx.await;
+            })
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{proxy_base}/healthz"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "/healthz must remain 200 even when upstream is unreachable",
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["version"], version());
+
+    let _ = sd_tx.send(());
+    let _ = server.await;
+    drop(pipeline.writer);
+    let _ = pipeline.task.await;
+}
+
+#[tokio::test]
+async fn unknown_path_returns_stable_json_error_shape() {
+    // Consumers parse the 404 body to differentiate "route not found"
+    // from upstream errors. Lock down the exact field shape so future
+    // refactors do not silently rename keys.
+    let rig = TestRig::start().await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/v2/messages", rig.proxy_base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        "application/json"
+    );
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // Top-level shape: { "error": { "type": "not_found", "message": <non-empty string> } }
+    let err = body
+        .get("error")
+        .expect("body has top-level `error` object");
+    assert_eq!(err.get("type").and_then(|v| v.as_str()), Some("not_found"));
+    let message = err
+        .get("message")
+        .and_then(|v| v.as_str())
+        .expect("error.message present and string");
+    assert!(!message.is_empty(), "error.message must be non-empty");
+
+    // The /v1/chat/completions hint should appear in the message so
+    // confused integrators learn the canonical path from a single 404.
+    assert!(
+        message.contains("/v1/chat/completions"),
+        "error.message should mention the canonical proxy path; got {message:?}",
+    );
+
+    // Also confirm that POST against an unknown path is still 404
+    // (the fallback covers every method, not just GET).
+    let resp = client
+        .post(format!("{}/nope", rig.proxy_base))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+
+    let traces = rig.shutdown_and_read_traces().await;
+    assert!(traces.is_empty(), "404 paths must not emit traces");
+}
+
+#[tokio::test]
 async fn upstream_base_url_is_used_for_provider_field() {
     let rig = TestRig::start().await;
     let upstream_host = rig
